@@ -32,6 +32,9 @@ jobs:
           python -m py_compile plugins/python-debugger/skills/python-debugging/scripts/debugger.py
           python -m py_compile plugins/python-debugger/skills/python-debugging/scripts/inspector.py
 
+      - name: Install test dependencies
+        run: pip install pytest
+
       - name: Run smoke tests
         run: python -m pytest tests/test_smoke.py -v --tb=short
         timeout-minutes: 5
