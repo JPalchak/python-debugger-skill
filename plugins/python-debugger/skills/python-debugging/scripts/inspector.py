@@ -10,8 +10,7 @@ Provides detailed inspection of Python objects including:
 - Circular reference detection
 """
 
-from typing import Any, Dict, List, Optional, Set
-import sys
+from typing import Any, Dict, Set
 
 # Configuration
 MAX_VALUE_LENGTH = 1000
@@ -50,7 +49,6 @@ class ObjectInspector:
         """
         obj_id = id(obj)
         type_name = type(obj).__name__
-        module = type(obj).__module__
 
         # Check for circular reference
         if obj_id in self._seen:
