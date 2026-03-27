@@ -1,0 +1,12 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Local session files (runtime artefacts)
+.claude_debugger/
+
+# OS / editor artefacts
+.DS_Store
+Thumbs.db
