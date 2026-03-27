@@ -7,8 +7,9 @@ stepping, variable inspection, and stack navigation.
 
 Architecture:
 - Uses bdb.Bdb for Python debugging
-- Persistent subprocess with Unix socket for IPC
+- Persistent subprocess with TCP loopback socket for IPC (cross-platform)
 - Session state stored in ~/.claude_debugger/
+- Supports Windows, macOS, and Linux
 """
 
 import argparse
@@ -25,6 +26,11 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Platform adapter — routes OS-specific process/signal behaviour
+_SCRIPTS_DIR = Path(__file__).parent
+sys.path.insert(0, str(_SCRIPTS_DIR)) if str(_SCRIPTS_DIR) not in sys.path else None
+from platform.factory import get_adapter as _get_platform_adapter  # noqa: E402
+
 # Session directory
 SESSION_DIR = Path.home() / ".claude_debugger"
 SOCKET_TIMEOUT = 30.0
@@ -32,6 +38,9 @@ EVAL_TIMEOUT = 5
 MAX_VALUE_LENGTH = 1000
 MAX_COLLECTION_ITEMS = 50
 MAX_STACK_DEPTH = 50
+# Timeout (seconds) for the server subprocess to start and publish its port.
+# If exceeded, cmd_start prints an error and terminates the orphaned subprocess.
+START_TIMEOUT = 10.0
 
 
 # =============================================================================
@@ -164,7 +173,7 @@ class SessionManager:
         self.script_path = os.path.abspath(script_path)
         self.session_id = self._generate_session_id()
         self.session_file = SESSION_DIR / f"{self.session_id}.json"
-        self.socket_path = SESSION_DIR / f"{self.session_id}.sock"
+        self.port: int = 0  # TCP port; populated after server binds
 
     def _generate_session_id(self) -> str:
         """Generate a unique session ID based on script path."""
@@ -180,7 +189,7 @@ class SessionManager:
         session_data = {
             "script": self.script_path,
             "pid": pid,
-            "socket": str(self.socket_path),
+            "port": self.port,
             "created": time.time(),
             "status": "starting"
         }
@@ -216,8 +225,13 @@ class SessionManager:
         """Clean up session files."""
         if self.session_file.exists():
             self.session_file.unlink()
-        if self.socket_path.exists():
-            self.socket_path.unlink()
+
+    @classmethod
+    def from_session_data(cls, data: Dict) -> "SessionManager":
+        """Create a SessionManager pre-loaded with data from a session dict."""
+        manager = cls(data["script"])
+        manager.port = data.get("port", 0)
+        return manager
 
     @classmethod
     def find_active_session(cls, script_path: str) -> Optional["SessionManager"]:
@@ -226,6 +240,7 @@ class SessionManager:
         session = manager.get_session()
 
         if session and cls._is_process_alive(session.get("pid")):
+            manager.port = session.get("port", 0)
             return manager
 
         # Clean up stale session
@@ -249,9 +264,6 @@ class SessionManager:
                     else:
                         # Clean up stale session
                         session_file.unlink()
-                        socket_file = session_file.with_suffix(".sock")
-                        if socket_file.exists():
-                            socket_file.unlink()
                 except (json.JSONDecodeError, IOError):
                     pass
         return sessions
@@ -259,12 +271,12 @@ class SessionManager:
     @staticmethod
     def _is_process_alive(pid: Optional[int]) -> bool:
         """Check if a process is still running."""
-        if pid is None:
+        if not pid:
             return False
         try:
             os.kill(pid, 0)
             return True
-        except (OSError, ProcessLookupError):
+        except (OSError, PermissionError, ProcessLookupError):
             return False
 
 
@@ -273,23 +285,20 @@ class SessionManager:
 # =============================================================================
 
 class DebuggerServer:
-    """Unix socket server for the debugger subprocess."""
+    """TCP loopback socket server for the debugger subprocess."""
 
-    def __init__(self, socket_path: Path):
-        self.socket_path = socket_path
+    def __init__(self):
+        self.port: int = 0
         self.server_socket: Optional[socket.socket] = None
         self.client_socket: Optional[socket.socket] = None
         self.running = False
 
     def start(self) -> None:
-        """Start the socket server."""
-        # Remove existing socket file
-        if self.socket_path.exists():
-            self.socket_path.unlink()
-
-        self.server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        """Start the socket server on a random available loopback port."""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind(str(self.socket_path))
+        self.server_socket.bind(("127.0.0.1", 0))
+        self.port = self.server_socket.getsockname()[1]
         self.server_socket.listen(1)
         self.server_socket.settimeout(1.0)  # Allow periodic checks
         self.running = True
@@ -377,32 +386,28 @@ class DebuggerServer:
                 self.server_socket.close()
             except Exception:
                 pass
-        if self.socket_path.exists():
-            try:
-                self.socket_path.unlink()
-            except Exception:
-                pass
 
 
 class DebuggerClient:
-    """Unix socket client for sending commands to the debugger."""
+    """TCP loopback socket client for sending commands to the debugger."""
 
-    def __init__(self, socket_path: Path):
-        self.socket_path = socket_path
+    def __init__(self, port: int):
+        self.port = port
         self.socket: Optional[socket.socket] = None
 
     def connect(self, timeout: float = 5.0) -> bool:
         """Connect to the debugger server."""
+        if not self.port:
+            return False
         start = time.time()
         while time.time() - start < timeout:
-            if self.socket_path.exists():
-                try:
-                    self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    self.socket.settimeout(SOCKET_TIMEOUT)
-                    self.socket.connect(str(self.socket_path))
-                    return True
-                except (ConnectionRefusedError, FileNotFoundError):
-                    self.socket = None
+            try:
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.settimeout(SOCKET_TIMEOUT)
+                self.socket.connect(("127.0.0.1", self.port))
+                return True
+            except (ConnectionRefusedError, OSError):
+                self.socket = None
             time.sleep(0.1)
         return False
 
@@ -461,7 +466,7 @@ class ClaudeDebugger(bdb.Bdb):
     def __init__(self, session_manager: SessionManager):
         super().__init__()
         self.session_manager = session_manager
-        self.server = DebuggerServer(session_manager.socket_path)
+        self.server = DebuggerServer()
 
         # Current state
         self.current_frame: Optional[Any] = None
@@ -477,8 +482,9 @@ class ClaudeDebugger(bdb.Bdb):
         # For graceful shutdown
         self.should_quit = False
 
-        # Setup signal handlers
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        # Setup signal handlers (SIGTERM is POSIX-only)
+        if sys.platform != "win32":
+            signal.signal(signal.SIGTERM, self._signal_handler)
         signal.signal(signal.SIGINT, self._signal_handler)
 
     def _signal_handler(self, signum, frame):
@@ -504,9 +510,10 @@ class ClaudeDebugger(bdb.Bdb):
         # Change to script directory
         os.chdir(script_dir)
 
-        # Start socket server
+        # Start socket server and publish the port in the session file
         self.server.start()
-        self.session_manager.update_session(status="running")
+        self.session_manager.port = self.server.port
+        self.session_manager.update_session(status="running", port=self.server.port)
 
         # Read and compile the script
         with open(script_path, "r") as f:
@@ -893,40 +900,44 @@ class ClaudeDebugger(bdb.Bdb):
         if not frame:
             return {"error": "No frame available"}
 
-        # Set up timeout
-        def timeout_handler(signum, frame):
-            raise TimeoutError("Expression evaluation timed out")
+        # Single-element lists let the nested _do_eval() closure write results
+        # back to the outer scope in a way that is compatible with Python 2/3
+        # and avoids the need for nonlocal declarations.
+        result_holder: List[Any] = [None]
+        error_holder: List[Optional[Exception]] = [None]
+        done_event = threading.Event()
 
-        old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-        signal.alarm(EVAL_TIMEOUT)
-
-        try:
-            # Try eval first (expressions)
+        def _do_eval() -> None:
             try:
-                result = eval(expr, frame.f_globals, frame.f_locals)
-            except SyntaxError:
-                # Try exec for statements
-                exec(expr, frame.f_globals, frame.f_locals)
-                result = None
+                try:
+                    result_holder[0] = eval(expr, frame.f_globals, frame.f_locals)
+                except SyntaxError:
+                    # Try exec for statements
+                    exec(expr, frame.f_globals, frame.f_locals)
+                    result_holder[0] = None
+            except Exception as exc:
+                error_holder[0] = exc
+            finally:
+                done_event.set()
 
-            signal.alarm(0)
+        t = threading.Thread(target=_do_eval, daemon=True)
+        t.start()
 
-            return {
-                "status": "ok",
-                "expression": expr,
-                "result": format_value(result, max_depth=3)
-            }
-
-        except TimeoutError:
+        if not done_event.wait(timeout=EVAL_TIMEOUT):
             return {"error": "Expression evaluation timed out (5s limit)"}
-        except Exception as e:
-            signal.alarm(0)
+
+        if error_holder[0] is not None:
+            e = error_holder[0]
             return {
                 "error": f"{type(e).__name__}: {e}",
                 "expression": expr
             }
-        finally:
-            signal.signal(signal.SIGALRM, old_handler)
+
+        return {
+            "status": "ok",
+            "expression": expr,
+            "result": format_value(result_holder[0], max_depth=3)
+        }
 
     def _cmd_inspect(self, command: Dict) -> Dict:
         """Deep inspect a variable or expression."""
@@ -1038,7 +1049,7 @@ class ClaudeDebugger(bdb.Bdb):
 
 def send_command(session: SessionManager, command: Dict) -> Dict:
     """Send a command to an active debugger session."""
-    client = DebuggerClient(session.socket_path)
+    client = DebuggerClient(session.port)
     if not client.connect():
         return {"error": "Could not connect to debugger. Is it running?"}
 
@@ -1058,48 +1069,85 @@ def cmd_start(args) -> int:
         return 1
 
     # Check for existing session
-    existing = SessionManager.find_active_session(script_path)
-    if existing:
+    session = SessionManager(script_path)
+    existing_data = session.get_session()
+    if existing_data and SessionManager._is_process_alive(existing_data.get("pid")):
         print(json.dumps({
             "error": "Debugger already running for this script",
             "hint": "Use 'debugger.py status' or 'debugger.py quit' first"
         }))
         return 1
 
-    # Create session manager
-    session = SessionManager(script_path)
+    # Remove any stale session file before spawning
+    session.delete_session()
+    SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Fork subprocess
-    pid = os.fork()
+    # Spawn the debugger server as a subprocess using the hidden _server command.
+    # Platform-specific kwargs (e.g. new session/process group) come from the adapter.
+    adapter = _get_platform_adapter()
+    cmd = [sys.executable, os.path.abspath(__file__), "_server", script_path] + args.args
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **adapter.get_subprocess_kwargs(),
+    )
+    pid = proc.pid
 
-    if pid == 0:
-        # Child process - run the debugger
+    # Poll the session file until the server publishes its port (or timeout)
+    deadline = time.time() + START_TIMEOUT
+    session_port = 0
+    while time.time() < deadline:
+        data = session.get_session()
+        if data and data.get("port", 0) > 0:
+            session.port = data["port"]
+            session_port = data["port"]
+            break
+        time.sleep(0.1)
+
+    if not session_port:
+        print(json.dumps({"error": "Debugger server did not start in time"}))
         try:
-            # Redirect stdout/stderr to prevent interfering with JSON output
-            # In a real implementation, you might log to a file
-            debugger = ClaudeDebugger(session)
-            debugger.run_script(script_path, args.args)
-        except Exception as e:
-            session.update_session(status="error", error=str(e))
-            sys.exit(1)
-        sys.exit(0)
+            proc.terminate()
+        except Exception:
+            pass
+        return 1
+
+    # Try to get initial status
+    client = DebuggerClient(session_port)
+    if client.connect(timeout=5.0):
+        response = client.send_command({"command": "status"})
+        client.close()
+        print(json.dumps(response if response else {"status": "started", "pid": pid}))
     else:
-        # Parent process
-        session.create_session(pid)
+        print(json.dumps({"status": "started", "pid": pid}))
 
-        # Wait for debugger to start
-        time.sleep(0.5)
+    return 0
 
-        # Try to get initial status
-        client = DebuggerClient(session.socket_path)
-        if client.connect(timeout=5.0):
-            response = client.send_command({"command": "status"})
-            client.close()
-            print(json.dumps(response if response else {"status": "started", "pid": pid}))
-        else:
-            print(json.dumps({"status": "started", "pid": pid}))
 
-        return 0
+def cmd_server(args) -> int:
+    """Internal: run the debugger server in the current process.
+
+    This is the hidden ``_server`` subcommand spawned by ``cmd_start``.
+    It creates the session file, starts the TCP server, updates the session
+    with the chosen port, and then runs the script under debugger control.
+    """
+    script_path = os.path.abspath(args.script)
+
+    if not os.path.exists(script_path):
+        sys.exit(1)
+
+    session = SessionManager(script_path)
+    # Create session file with our own PID so the parent can track us
+    session.create_session(os.getpid())
+
+    try:
+        debugger = ClaudeDebugger(session)
+        debugger.run_script(script_path, args.args)
+    except Exception as e:
+        session.update_session(status="error", error=str(e))
+        sys.exit(1)
+    sys.exit(0)
 
 
 def cmd_status(args) -> int:
@@ -1139,7 +1187,7 @@ def cmd_break(args) -> int:
     if not session:
         sessions = SessionManager.get_all_sessions()
         if sessions:
-            session = SessionManager(sessions[0]["script"])
+            session = SessionManager.from_session_data(sessions[0])
         else:
             print(json.dumps({"error": "No active debugger session"}))
             return 1
@@ -1166,7 +1214,7 @@ def cmd_delete(args) -> int:
         print(json.dumps({"error": "No active debugger session"}))
         return 1
 
-    session = SessionManager(sessions[0]["script"])
+    session = SessionManager.from_session_data(sessions[0])
 
     command = {"command": "delete"}
     if args.exception:
@@ -1192,7 +1240,7 @@ def cmd_breakpoints(args) -> int:
         print(json.dumps({"error": "No active debugger session"}))
         return 1
 
-    session = SessionManager(sessions[0]["script"])
+    session = SessionManager.from_session_data(sessions[0])
     response = send_command(session, {"command": "breakpoints"})
     print(json.dumps(response))
     return 0
@@ -1205,7 +1253,7 @@ def cmd_execution(args, command: str) -> int:
         print(json.dumps({"error": "No active debugger session"}))
         return 1
 
-    session = SessionManager(sessions[0]["script"])
+    session = SessionManager.from_session_data(sessions[0])
     response = send_command(session, {"command": command})
 
     # Wait a moment for the debugger to hit next stop
@@ -1230,7 +1278,7 @@ def cmd_locals(args) -> int:
         print(json.dumps({"error": "No active debugger session"}))
         return 1
 
-    session = SessionManager(sessions[0]["script"])
+    session = SessionManager.from_session_data(sessions[0])
     command = {"command": "locals"}
     if args.depth:
         command["depth"] = args.depth
@@ -1247,7 +1295,7 @@ def cmd_globals(args) -> int:
         print(json.dumps({"error": "No active debugger session"}))
         return 1
 
-    session = SessionManager(sessions[0]["script"])
+    session = SessionManager.from_session_data(sessions[0])
     command = {"command": "globals"}
     if args.depth:
         command["depth"] = args.depth
@@ -1264,7 +1312,7 @@ def cmd_eval(args) -> int:
         print(json.dumps({"error": "No active debugger session"}))
         return 1
 
-    session = SessionManager(sessions[0]["script"])
+    session = SessionManager.from_session_data(sessions[0])
     response = send_command(session, {"command": "eval", "expression": args.expression})
     print(json.dumps(response))
     return 0
@@ -1277,7 +1325,7 @@ def cmd_inspect(args) -> int:
         print(json.dumps({"error": "No active debugger session"}))
         return 1
 
-    session = SessionManager(sessions[0]["script"])
+    session = SessionManager.from_session_data(sessions[0])
     command = {"command": "inspect", "expression": args.expression}
     if args.depth:
         command["depth"] = args.depth
@@ -1294,7 +1342,7 @@ def cmd_stack(args) -> int:
         print(json.dumps({"error": "No active debugger session"}))
         return 1
 
-    session = SessionManager(sessions[0]["script"])
+    session = SessionManager.from_session_data(sessions[0])
     response = send_command(session, {"command": "stack"})
     print(json.dumps(response))
     return 0
@@ -1307,7 +1355,7 @@ def cmd_up(args) -> int:
         print(json.dumps({"error": "No active debugger session"}))
         return 1
 
-    session = SessionManager(sessions[0]["script"])
+    session = SessionManager.from_session_data(sessions[0])
     response = send_command(session, {"command": "up"})
     print(json.dumps(response))
     return 0
@@ -1320,7 +1368,7 @@ def cmd_down(args) -> int:
         print(json.dumps({"error": "No active debugger session"}))
         return 1
 
-    session = SessionManager(sessions[0]["script"])
+    session = SessionManager.from_session_data(sessions[0])
     response = send_command(session, {"command": "down"})
     print(json.dumps(response))
     return 0
@@ -1333,7 +1381,7 @@ def cmd_quit(args) -> int:
         print(json.dumps({"status": "no_active_sessions"}))
         return 0
 
-    session = SessionManager(sessions[0]["script"])
+    session = SessionManager.from_session_data(sessions[0])
     response = send_command(session, {"command": "quit"})
 
     # Clean up session
@@ -1410,6 +1458,11 @@ def main():
     # quit
     subparsers.add_parser("quit", help="Quit the debugger")
 
+    # _server (internal subcommand; not shown in public help)
+    _server_parser = subparsers.add_parser("_server", help=argparse.SUPPRESS)
+    _server_parser.add_argument("script", help="Script path")
+    _server_parser.add_argument("args", nargs="*", help="Script arguments")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1434,6 +1487,7 @@ def main():
         "up": cmd_up,
         "down": cmd_down,
         "quit": cmd_quit,
+        "_server": cmd_server,
     }
 
     handler = command_handlers.get(args.command)

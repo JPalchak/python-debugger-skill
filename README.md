@@ -91,6 +91,12 @@ PyCharm-like Python debugging with breakpoints, stepping, variable inspection, a
 python-debugger-skill/
 ├── .claude-plugin/
 │   └── marketplace.json
+├── .github/
+│   └── workflows/
+│       └── ci.yml               # Cross-platform CI matrix
+├── docs/
+│   ├── platform-audit.md        # OS-coupling audit and refactor plan
+│   └── windows-troubleshooting.md
 ├── plugins/
 │   └── python-debugger/
 │       ├── .claude-plugin/
@@ -100,14 +106,22 @@ python-debugger-skill/
 │               ├── SKILL.md
 │               ├── scripts/
 │               │   ├── debugger.py
-│               │   └── inspector.py
+│               │   ├── inspector.py
+│               │   └── platform/    # Cross-platform adapter layer
+│               │       ├── base.py
+│               │       ├── posix.py
+│               │       ├── windows.py
+│               │       └── factory.py
 │               └── references/
 │                   ├── methodology.md
 │                   ├── commands.md
 │                   ├── examples.md
 │                   └── troubleshooting.md
+├── tests/
+│   └── test_smoke.py            # Baseline cross-platform smoke tests
 ├── examples/
 │   └── buggy_calculator.py      # Try debugging this!
+├── CONTRIBUTING.md
 └── README.md
 ```
 
@@ -169,8 +183,22 @@ Just describe the problem naturally:
 
 ## Requirements
 
-- Python 3.7+
-- macOS or Linux
+- Python 3.8+
+- Windows, macOS, or Linux
+
+## Platform Support
+
+| Platform | Status |
+|---|---|
+| Linux (Ubuntu 20.04+) | ✅ Fully supported |
+| macOS (12+) | ✅ Fully supported |
+| Windows (10/11) | ✅ Fully supported |
+
+The debugger uses TCP loopback sockets for IPC so it works identically on all
+platforms without any OS-specific configuration.
+
+See [docs/windows-troubleshooting.md](docs/windows-troubleshooting.md) for
+Windows-specific tips.
 
 ## License
 
