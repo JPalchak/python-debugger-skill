@@ -220,15 +220,23 @@ class TestTCPSocketIPC(unittest.TestCase):
             run_debugger("start", script, timeout=15)
             time.sleep(0.5)
 
-            if session_dir.exists():
-                for jf in session_dir.glob("debug_*.json"):
-                    with open(jf) as fh:
-                        data = json.load(fh)
-                    self.assertIn("port", data, f"No 'port' key in {jf}")
-                    self.assertGreater(data["port"], 0,
-                                      f"Port is zero in {jf}")
-                    self.assertNotIn("socket", data,
-                                     f"Old 'socket' key still present in {jf}")
+            # Compute the expected session file for *this* script so we don't
+            # accidentally assert on stale files left by other tests.
+            import hashlib
+            path_hash = hashlib.md5(
+                os.path.abspath(script).encode()
+            ).hexdigest()[:8]
+            session_file = session_dir / f"debug_{path_hash}.json"
+
+            self.assertTrue(session_file.exists(),
+                            f"Session file not found: {session_file}")
+            with open(session_file) as fh:
+                data = json.load(fh)
+            self.assertIn("port", data, f"No 'port' key in {session_file}")
+            self.assertGreater(data["port"], 0,
+                               f"Port is zero in {session_file}")
+            self.assertNotIn("socket", data,
+                             f"Old 'socket' key still present in {session_file}")
         finally:
             run_debugger("quit", timeout=5)
             os.unlink(script)

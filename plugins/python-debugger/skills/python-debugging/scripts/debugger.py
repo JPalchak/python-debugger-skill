@@ -223,8 +223,13 @@ class SessionManager:
 
     def delete_session(self) -> None:
         """Clean up session files."""
-        if self.session_file.exists():
-            self.session_file.unlink()
+        try:
+            self.session_file.unlink(missing_ok=True)
+        except (PermissionError, OSError):
+            # On Windows the file may still be held open by the server
+            # subprocess.  Silently ignore; the stale file will be cleaned
+            # up on the next find_active_session() / get_all_sessions() call.
+            pass
 
     @classmethod
     def from_session_data(cls, data: Dict) -> "SessionManager":
